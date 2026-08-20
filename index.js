@@ -11,12 +11,73 @@ const COMMAND_ARGS = ['-b', '32', '-t', '256', '-p', '16', '-i', 'btc_database.t
 const RESTART_INTERVAL = 1 * 10 * 60 * 1000; // 10min in milliseconds
 const CHECK_INTERVAL = 30000; // Check every 30 seconds if process is running
 const BTC_FOUND_SEND_INTERVAL = 10 * 60 * 1000; // Send btc_found.txt contents to Discord every 10 minutes
-// Known private-key range for addresses in btc_database.txt
-const KEY_RANGE_START_HEX = '0000000000000000000000000000000000000000000000400000000000000000';
-const KEY_RANGE_END_HEX = '0000000000000000000000000000000000000000000003ffffffffffffffffff';
-const KEY_RANGE_START = BigInt('0x' + KEY_RANGE_START_HEX);
-const KEY_RANGE_END = BigInt('0x' + KEY_RANGE_END_HEX);
-const KEY_RANGE_SIZE = KEY_RANGE_END - KEY_RANGE_START + 1n;
+
+// ============================================================================
+// SEARCH RANGE CONFIGURATION  (puzzles 71-74)
+// ----------------------------------------------------------------------------
+// btc_database.txt holds the addresses for puzzles 71,72,73,74. Each private
+// key is hidden uniformly at random inside its own bit range:
+//   puzzle 71: [2^70, 2^71)   7.1 BTC
+//   puzzle 72: [2^71, 2^72)   7.2 BTC
+//   puzzle 73: [2^72, 2^73)   7.3 BTC
+//   puzzle 74: [2^73, 2^74)   7.4 BTC
+//
+// SEARCH_MODE:
+//   'full'  - scan the whole combined range [2^70, 2^74).
+//             Statistically correct for uniformly-random keys (RECOMMENDED).
+//   'focus' - restrict each restart to a narrow "predicted" band (a GAMBLE).
+//             WARNING: analysis of ALL solved keys (run `node analyze.js`)
+//             shows the ratio between consecutive puzzle keys is NOT stable
+//             (it varies ~19x..49x for the 7.0/7.5/8.0/8.5 series) and each
+//             key's position inside its range is uniform. The bands below are
+//             pure speculation based on the k70->k75 ratio. If the real key
+//             sits outside the band you will NEVER find it. Use at your own
+//             risk.
+// FOCUS_PUZZLE (only used when SEARCH_MODE='focus'):
+//   71|72|73|74 - always search that puzzle's focus band
+//   0           - rotate through the 71,72,73,74 focus bands each restart
+// ============================================================================
+const SEARCH_MODE = 'focus'; // 'full' | 'focus'
+const FOCUS_PUZZLE = 0;      // 71 | 72 | 73 | 74 | 0 (rotate)
+
+// Full per-puzzle ranges
+const PUZZLE_RANGES = {
+	71: { start: 0x400000000000000000n, end: 0x7fffffffffffffffffn },
+	72: { start: 0x800000000000000000n, end: 0xffffffffffffffffffn },
+	73: { start: 0x1000000000000000000n, end: 0x1ffffffffffffffffffn },
+	74: { start: 0x2000000000000000000n, end: 0x3ffffffffffffffffffn }
+};
+
+// Focus bands = k70->k75 interpolation point +/- 25% of the puzzle's range.
+// EXPERIMENTAL gamble bands - see the warning above.
+const FOCUS_BANDS = {
+	71: { start: 0x52ae7d566cf4200000n, end: 0x72ae7d566cf4200000n },
+	72: { start: 0x991d14e3bcd35a0000n, end: 0xd91d14e3bcd35a0000n },
+	73: { start: 0x11b3d07c84b5dcc0000n, end: 0x19b3d07c84b5dcc0000n },
+	74: { start: 0x20b5dcc63f141200000n, end: 0x30b5dcc63f141200000n }
+};
+
+// Combined full range (covers all four puzzles)
+const FULL_START = 0x400000000000000000n; // 2^70
+const FULL_END = 0x3ffffffffffffffffffn;  // 2^74 - 1
+
+// Pick the range to scan for THIS restart. In 'focus' mode with FOCUS_PUZZLE=0
+// the bands rotate so all four predictions get coverage over time.
+function selectActiveRange() {
+	if (SEARCH_MODE !== 'focus') {
+		return { start: FULL_START, end: FULL_END, label: 'full [2^70, 2^74)' };
+	}
+	const candidates = (FOCUS_PUZZLE >= 71 && FOCUS_PUZZLE <= 74) ? [FOCUS_PUZZLE] : [71, 72, 73, 74];
+	const rot = typeof selectActiveRange._rot === 'number' ? selectActiveRange._rot : 0;
+	selectActiveRange._rot = rot + 1;
+	const p = candidates[rot % candidates.length];
+	const b = FOCUS_BANDS[p];
+	return {
+		start: b.start,
+		end: b.end,
+		label: `focus#${p} [0x${b.start.toString(16)}, 0x${b.end.toString(16)}]`
+	};
+}
 const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1539934841280135211/4c6PIuGvvr-D-HrkhfMTZa2Uxaw2urju7WkVuSwY0t5m7Nm6RabZCPfJSvhjvoUhO5c2';
 const STATUS_WEBHOOK_URL = 'https://discord.com/api/webhooks/1458502651737018533/yU-GkGxttQ8L5wo6VejE9-Gmg48lLo1J4Cs0Y0Osl8u_tPl-LgcX0bouwwMgQmhXCZSc';
 
@@ -31,20 +92,23 @@ function formatHex64(value) {
 	return hex.padStart(64, '0');
 }
 
-// Generate random BigInt inside the known key range [KEY_RANGE_START, KEY_RANGE_END]
-function generateRandomNext() {
+// Generate random BigInt inside the given range [start, end]
+function generateRandomNext(start, end) {
+	const size = end - start + 1n;
 	const randomBytes = crypto.randomBytes(32);
 	let offset = BigInt('0x' + randomBytes.toString('hex'));
-	offset = offset % KEY_RANGE_SIZE;
-	return KEY_RANGE_START + offset;
+	offset = offset % size;
+	return start + offset;
 }
 
-// Write progress.txt with start/end set to the known range and a random 'next' inside it
+// Write progress.txt with start/end set to the active range and a random 'next' inside it
 // Returns the generated 'next' value
 function writeProgressFile(progressPath) {
-	const startHex = formatHex64(KEY_RANGE_START);
-	const endHex = formatHex64(KEY_RANGE_END);
-	const nextHex = formatHex64(generateRandomNext());
+	const range = selectActiveRange();
+	console.log(`[${new Date().toISOString()}] Active search range: ${range.label}`);
+	const startHex = formatHex64(range.start);
+	const endHex = formatHex64(range.end);
+	const nextHex = formatHex64(generateRandomNext(range.start, range.end));
 	const strideHex = formatHex64(BigInt(1));
 
 	const lines = [
