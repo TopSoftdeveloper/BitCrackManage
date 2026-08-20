@@ -89,6 +89,11 @@ dist
 # https://nextjs.org/blog/next-9-1#public-directory-support
 # public
 
+# BitCrack manager runtime data
+instances/
+progress.txt
+btc_found_*.txt
+
 # vuepress build output
 .vuepress/dist
 

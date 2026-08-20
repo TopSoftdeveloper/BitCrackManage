@@ -1,7 +1,7 @@
 {
   "name": "cubitcrack-manager",
-  "version": "1.0.0",
-  "description": "Node.js manager for cuBitCrack (Linux CUDA) with auto-restart and random share generation",
+  "version": "2.0.0",
+  "description": "Multi-instance Node.js manager for cuBitCrack: detects NVIDIA GPUs, runs one instance per GPU (each with its own workspace + key range), merges finds into btc_found.txt and reports to Discord.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,12 +9,13 @@
   "keywords": [
     "bitcrack",
     "bitcoin",
+    "cuda",
     "manager"
   ],
   "author": "",
   "license": "ISC",
   "engines": {
-    "node": ">=12.0.0"
+    "node": ">=18.0.0"
   }
 }
 
