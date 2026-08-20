@@ -13,6 +13,8 @@ git clone https://github.com/TopSoftdeveloper/BitCrackManage.git
 
 cd /workspace/BitCrackManage
 
+#git checkout 5060
+
 chmod 755 ./cuBitCrack
 
 pm2 delete myapp >/dev/null 2>&1 || true
