@@ -1,20 +1,113 @@
-'use strict';
-
+const { spawn, exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 const os = require('os');
-const logger = require('./lib/logger');
-const config = require('./config');
-const { detectGpus } = require('./lib/gpu');
-const { sendDiscordMessage, sendStatusDiscordMessage } = require('./lib/discord');
-const { FoundMerger, sendSharedFoundContent } = require('./lib/found');
-const Manager = require('./lib/manager');
-const { formatHex64 } = require('./lib/ranges');
+const crypto = require('crypto');
 
-let manager = null;
-let merger = null;
+// Configuration
+const EXE_NAME = 'cuBitCrack'; // CUDA BitCrack binary (Linux)
+const COMMAND_ARGS = ['-b', '32', '-t', '256', '-p', '16', '-i', 'btc_database.txt', '-o', 'btc_found.txt'];
+const RESTART_INTERVAL = 1 * 10 * 60 * 1000; // 10min in milliseconds
+const CHECK_INTERVAL = 30000; // Check every 30 seconds if process is running
+const BTC_FOUND_SEND_INTERVAL = 10 * 60 * 1000; // Send btc_found.txt contents to Discord every 10 minutes
+// Known private-key range for addresses in btc_database.txt
+const KEY_RANGE_START_HEX = '0000000000000000000000000000000000000000000000400000000000000000';
+const KEY_RANGE_END_HEX = '0000000000000000000000000000000000000000000003ffffffffffffffffff';
+const KEY_RANGE_START = BigInt('0x' + KEY_RANGE_START_HEX);
+const KEY_RANGE_END = BigInt('0x' + KEY_RANGE_END_HEX);
+const KEY_RANGE_SIZE = KEY_RANGE_END - KEY_RANGE_START + 1n;
+const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1539934841280135211/4c6PIuGvvr-D-HrkhfMTZa2Uxaw2urju7WkVuSwY0t5m7Nm6RabZCPfJSvhjvoUhO5c2';
+const STATUS_WEBHOOK_URL = 'https://discord.com/api/webhooks/1458502651737018533/yU-GkGxttQ8L5wo6VejE9-Gmg48lLo1J4Cs0Y0Osl8u_tPl-LgcX0bouwwMgQmhXCZSc';
 
-// ----------------------------------------------------------------------
-// Machine info helpers
-// ----------------------------------------------------------------------
+let currentProcess = null;
+let restartTimer = null;
+let checkInterval = null;
+let startTime = null;
+
+// Format BigInt as 64-char uppercase hex (zero-padded)
+function formatHex64(value) {
+	const hex = value.toString(16).toUpperCase();
+	return hex.padStart(64, '0');
+}
+
+// Generate random BigInt inside the known key range [KEY_RANGE_START, KEY_RANGE_END]
+function generateRandomNext() {
+	const randomBytes = crypto.randomBytes(32);
+	let offset = BigInt('0x' + randomBytes.toString('hex'));
+	offset = offset % KEY_RANGE_SIZE;
+	return KEY_RANGE_START + offset;
+}
+
+// Write progress.txt with start/end set to the known range and a random 'next' inside it
+// Returns the generated 'next' value
+function writeProgressFile(progressPath) {
+	const startHex = formatHex64(KEY_RANGE_START);
+	const endHex = formatHex64(KEY_RANGE_END);
+	const nextHex = formatHex64(generateRandomNext());
+	const strideHex = formatHex64(BigInt(1));
+
+	const lines = [
+		`start=${startHex}`,
+		`next=${nextHex}`,
+		`end=${endHex}`,
+		`blocks=32`,
+		`threads=256`,
+		`points=16`,
+		`compression=compressed`,
+		`device=0`,
+		`elapsed=0`,
+		`stride=${strideHex}`
+	];
+
+	fs.writeFileSync(progressPath, lines.join('\n'), 'utf8');
+	return nextHex;
+}
+
+// ---- Discord webhook + btc_found.txt monitor ----
+function postDiscord(urlString, message, callback) {
+	try {
+		const data = JSON.stringify({ content: message });
+		const url = new URL(urlString);
+
+		const options = {
+			method: 'POST',
+			hostname: url.hostname,
+			path: url.pathname + url.search,
+			headers: {
+				'Content-Type': 'application/json',
+				'Content-Length': Buffer.byteLength(data)
+			}
+		};
+
+		const req = https.request(options, (res) => {
+			res.on('data', () => {});
+			res.on('end', () => {
+				if (typeof callback === 'function') callback();
+			});
+		});
+
+		req.on('error', (err) => {
+			console.error(`[${new Date().toISOString()}] Discord webhook error:`, err.message);
+			if (typeof callback === 'function') callback(err);
+		});
+
+		req.write(data);
+		req.end();
+	} catch (err) {
+		console.error(`[${new Date().toISOString()}] Discord webhook exception:`, err);
+		if (typeof callback === 'function') callback(err);
+	}
+}
+
+function sendDiscordMessage(message, callback) {
+	postDiscord(DISCORD_WEBHOOK_URL, message, callback);
+}
+
+function sendStatusDiscordMessage(message, callback) {
+	postDiscord(STATUS_WEBHOOK_URL, message, callback);
+}
+
 function formatBytesToGiB(bytes) {
 	const gib = bytes / (1024 * 1024 * 1024);
 	return `${gib.toFixed(2)} GiB`;
@@ -33,103 +126,470 @@ function getPrimaryMacAddress() {
 	return 'unknown';
 }
 
-function buildMachineInfo() {
+function buildStatusMessage(nextValue) {
+	const hostname = os.hostname();
 	const cpus = os.cpus() || [];
 	const cpuModel = cpus.length > 0 ? cpus[0].model : 'unknown';
-	return [
-		`Time: ${new Date().toISOString()}`,
-		`Host: ${os.hostname()}`,
-		`CPU: ${cpuModel} (${cpus.length} cores)`,
-		`RAM: ${formatBytesToGiB(os.freemem())} free / ${formatBytesToGiB(os.totalmem())} total`,
-		`MAC: ${getPrimaryMacAddress()}`,
+	const cpuCores = cpus.length;
+	const cpuSpeed = cpus.length > 0 && cpus[0].speed ? `${cpus[0].speed} MHz` : 'unknown';
+	const totalMem = formatBytesToGiB(os.totalmem());
+	const freeMem = formatBytesToGiB(os.freemem());
+	const mac = getPrimaryMacAddress();
+	const now = new Date().toISOString();
+
+	const lines = [
+		'cuBitCrack status: running',
+		`Time: ${now}`,
+		`Host: ${hostname}`,
+		`CPU: ${cpuModel} (${cpuCores} cores @ ${cpuSpeed})`,
+		`RAM: ${freeMem} free / ${totalMem} total`,
+		`MAC: ${mac}`
 	];
-}
 
-function buildStatusMessage(mode, gpus, mgr) {
-	return [
-		'BitCrack manager status: running',
-		`Mode: ${mode === 'gpu' ? `GPU (${gpus.length} NVIDIA device(s))` : 'monitor-only (no NVIDIA GPU available)'}`,
-		...buildMachineInfo(),
-		`Instances: ${mgr.instances.length}`,
-		...mgr.instances.map(
-			(inst) =>
-				`  instance ${inst.id}: device=${inst.device ?? '-'} ` +
-				`range=${formatHex64(inst.segment.start)}..${formatHex64(inst.segment.end)} ` +
-				`running=${inst.isRunning()}`
-		),
-	].join('\n');
-}
-
-// ----------------------------------------------------------------------
-// Found-key handling (new keys merged into the shared btc_found.txt)
-// ----------------------------------------------------------------------
-function onNewFound(lines) {
-	const preview = lines.join('\n');
-	const trimmed = preview.length > 1800 ? preview.slice(0, 1800) + '\n...[truncated]...' : preview;
-	logger.info(`New find(s) -> Discord (${lines.length} line(s))`);
-	sendDiscordMessage('You became Millionaire content:\n```\n' + trimmed + '\n```');
-}
-
-// ----------------------------------------------------------------------
-// Main
-// ----------------------------------------------------------------------
-async function main() {
-	logger.info('Starting BitCrack multi-instance manager...');
-	logger.info(`Node ${process.version} on ${process.platform}/${process.arch}`);
-
-	// 1) Detect NVIDIA GPUs
-	const gpus = await detectGpus();
-
-	// 2) Resolve mode
-	let mode;
-	if (config.mode === 'gpu') mode = 'gpu';
-	else if (config.mode === 'none') mode = 'none';
-	else mode = gpus.length > 0 ? 'gpu' : 'none';
-	logger.info(`Resolved mode: ${mode}`);
-
-	// 3) Start instances (one per GPU in GPU mode; none in monitor-only)
-	manager = new Manager({ mode, gpus });
-	manager.start();
-
-	// 4) Merge per-instance found files into shared btc_found.txt + Discord
-	merger = new FoundMerger({ onNewContent: onNewFound });
-	for (const inst of manager.instances) {
-		merger.addInstanceFoundFile(inst.id, inst.foundPath);
+	if (nextValue) {
+		lines.push(`Next: ${nextValue}`);
 	}
-	merger.start();
 
-	// 5) Heartbeat: full btc_found.txt to Discord every 10 min
+	return lines.join('\n');
+}
+
+function startBtcFoundMonitor() {
+	const filePath = path.join(__dirname, 'btc_found.txt');
+	let lastSize = 0;
+	let isReading = false;
+
+	function readNewContent(from, to) {
+		if (isReading) return;
+		isReading = true;
+		try {
+			const stream = fs.createReadStream(filePath, { start: from, end: to - 1, encoding: 'utf8' });
+			let buffer = '';
+			stream.on('data', (chunk) => {
+				buffer += chunk;
+			});
+			stream.on('end', () => {
+				isReading = false;
+				const trimmed = (buffer || '').trim();
+				if (trimmed.length > 0) {
+					const preview = trimmed.length > 1800 ? trimmed.slice(0, 1800) + '\n...[truncated]...' : trimmed;
+					console.log(`[${new Date().toISOString()}] btc_found.txt updated, sending to Discord (${trimmed.length} chars)`);
+					sendDiscordMessage('You became Millionaire content:\n```\n' + preview + '\n```');
+				}
+			});
+			stream.on('error', (err) => {
+				isReading = false;
+				console.error(`[${new Date().toISOString()}] Error reading btc_found.txt:`, err.message);
+			});
+		} catch (err) {
+			isReading = false;
+			console.error(`[${new Date().toISOString()}] Exception reading btc_found.txt:`, err.message);
+		}
+	}
+
+	function primeAndWatch() {
+		fs.stat(filePath, (err, stats) => {
+			if (!err && stats && stats.isFile()) {
+				if (stats.size > 0 && lastSize === 0) {
+					readNewContent(0, stats.size);
+				}
+				lastSize = stats.size;
+			}
+
+			try {
+				const watcher = fs.watch(filePath, (event) => {
+					if (event === 'change') {
+						fs.stat(filePath, (err2, stats2) => {
+							if (err2 || !stats2) return;
+							if (stats2.size > lastSize) {
+								const from = lastSize;
+								const to = stats2.size;
+								lastSize = stats2.size;
+								readNewContent(from, to);
+							} else if (stats2.size < lastSize) {
+								lastSize = stats2.size;
+								if (stats2.size > 0) {
+									readNewContent(0, stats2.size);
+								}
+							}
+						});
+					}
+				});
+
+				watcher.on('error', (werr) => {
+					console.error(`[${new Date().toISOString()}] btc_found.txt watcher error:`, werr.message);
+				});
+
+				console.log(`[${new Date().toISOString()}] Monitoring btc_found.txt for changes...`);
+			} catch (wex) {
+				console.error(`[${new Date().toISOString()}] Failed to watch btc_found.txt:`, wex.message);
+				setInterval(() => {
+					fs.stat(filePath, (perr, pstats) => {
+						if (perr || !pstats) return;
+						if (pstats.size > lastSize) {
+							const from = lastSize;
+							const to = pstats.size;
+							lastSize = pstats.size;
+							readNewContent(from, to);
+						} else if (pstats.size < lastSize) {
+							lastSize = pstats.size;
+							if (pstats.size > 0) {
+								readNewContent(0, pstats.size);
+							}
+						}
+					});
+				}, 3000);
+			}
+		});
+	}
+
+	fs.access(filePath, fs.constants.F_OK, (err) => {
+		if (err) {
+			fs.writeFile(filePath, '', 'utf8', () => {
+				primeAndWatch();
+			});
+		} else {
+			primeAndWatch();
+		}
+	});
+}
+// ---- end btc_found.txt monitor ----
+
+// Read all content from btc_found.txt and send it to Discord.
+// Runs every BTC_FOUND_SEND_INTERVAL (10 minutes). Sends nothing if the file is empty.
+// Discord messages are capped at 2000 chars, so content is split into chunks to send all data.
+function sendBtcFoundContent() {
+	const filePath = path.join(__dirname, 'btc_found.txt');
+	fs.readFile(filePath, 'utf8', (err, content) => {
+		if (err) {
+			console.error(`[${new Date().toISOString()}] Error reading btc_found.txt:`, err.message);
+			return;
+		}
+		const trimmed = (content || '').trim();
+		if (trimmed.length === 0) {
+			console.log(`[${new Date().toISOString()}] btc_found.txt is empty, skipping 10-min webhook send`);
+			return;
+		}
+		console.log(`[${new Date().toISOString()}] Sending btc_found.txt content to Discord (${trimmed.length} chars)`);
+		const chunkSize = 1900;
+		const chunks = [];
+		for (let i = 0; i < trimmed.length; i += chunkSize) {
+			chunks.push(trimmed.slice(i, i + chunkSize));
+		}
+		chunks.forEach((chunk, index) => {
+			const header = chunks.length > 1
+				? `btc_found.txt data (10-min update) part ${index + 1}/${chunks.length}:\n`
+				: 'btc_found.txt data (10-min update):\n';
+			sendDiscordMessage(header + '```\n' + chunk + '\n```');
+		});
+	});
+}
+
+// Check if cuBitCrack is running
+function isProcessRunning(callback) {
+    if (process.platform === 'win32') {
+        // Windows: use tasklist
+        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}"`, (error, stdout) => {
+            if (error) {
+                callback(false);
+                return;
+            }
+            callback(stdout.toLowerCase().includes(EXE_NAME.toLowerCase()));
+        });
+    } else {
+        // Unix-like: use ps
+        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+            callback(stdout.trim().length > 0);
+        });
+    }
+}
+
+// Count how many cuBitCrack processes are running
+function countProcesses(callback) {
+    if (process.platform === 'win32') {
+        // Windows: use tasklist and count occurrences
+        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
+            if (error) {
+                callback(0);
+                return;
+            }
+            // Count lines that contain the exe name (excluding header)
+            const lines = stdout.split('\n');
+            let count = 0;
+            for (const line of lines) {
+                if (line.toLowerCase().includes(EXE_NAME.toLowerCase()) && 
+                    !line.toLowerCase().includes('image name')) {
+                    count++;
+                }
+            }
+            callback(count);
+        });
+    } else {
+        // Unix-like: use ps and count
+        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+            if (error || !stdout.trim()) {
+                callback(0);
+                return;
+            }
+            // Count lines (each line is a process)
+            const lines = stdout.trim().split('\n');
+            callback(lines.length);
+        });
+    }
+}
+
+// Kill one specific process by PID
+function killProcessByPid(pid, callback) {
+    if (process.platform === 'win32') {
+        exec(`taskkill /F /PID ${pid}`, (error) => {
+            // Ignore error if process doesn't exist
+            setTimeout(() => callback(), 500);
+        });
+    } else {
+        exec(`kill -9 ${pid}`, (error) => {
+            setTimeout(() => callback(), 500);
+        });
+    }
+}
+
+// Get PIDs of all cuBitCrack processes
+function getProcessPids(callback) {
+    if (process.platform === 'win32') {
+        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
+            if (error) {
+                callback([]);
+                return;
+            }
+            const lines = stdout.split('\n');
+            const pids = [];
+            for (const line of lines) {
+                if (line.toLowerCase().includes(EXE_NAME.toLowerCase()) && 
+                    !line.toLowerCase().includes('image name')) {
+                    // Parse CSV: "Image Name","PID","Session Name",...
+                    const matches = line.match(/"([^"]+)","(\d+)"/);
+                    if (matches && matches[2]) {
+                        pids.push(parseInt(matches[2]));
+                    }
+                }
+            }
+            callback(pids);
+        });
+    } else {
+        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+            if (error || !stdout.trim()) {
+                callback([]);
+                return;
+            }
+            const lines = stdout.trim().split('\n');
+            const pids = [];
+            for (const line of lines) {
+                // ps aux format: USER PID ...
+                const parts = line.trim().split(/\s+/);
+                if (parts.length > 1) {
+                    const pid = parseInt(parts[1]);
+                    if (!isNaN(pid)) {
+                        pids.push(pid);
+                    }
+                }
+            }
+            callback(pids);
+        });
+    }
+}
+
+// Force kill cuBitCrack
+function forceKillProcess(callback) {
+    if (process.platform === 'win32') {
+        exec(`taskkill /F /IM ${EXE_NAME}`, (error) => {
+            // Ignore error if process doesn't exist
+            setTimeout(() => callback(), 1000);
+        });
+    } else {
+        exec(`pkill -9 -f "${EXE_NAME}"`, (error) => {
+            setTimeout(() => callback(), 1000);
+        });
+    }
+}
+
+// Start cuBitCrack using --continue progress.txt
+function startProcess() {
+	// Create/overwrite progress.txt with new random 'next'
+	const progressPath = path.join(__dirname, 'progress.txt');
+	const nextValue = writeProgressFile(progressPath);
+
+	console.log(`[${new Date().toISOString()}] Starting ${EXE_NAME} with --continue progress.txt`);
+
+	// Build command arguments
+	const args = [...COMMAND_ARGS, '--continue', 'progress.txt'];
+    
+    // Spawn the process
+    currentProcess = spawn(path.join(__dirname, EXE_NAME), args, {
+        cwd: __dirname,
+        stdio: 'inherit'
+    });
+    
+    startTime = Date.now();
+
+	// Send status to Discord status webhook with next value
+	try {
+		const statusMsg = buildStatusMessage(nextValue);
+		sendStatusDiscordMessage(statusMsg);
+	} catch (e) {
+		console.error(`[${new Date().toISOString()}] Failed to send status webhook:`, e && e.message ? e.message : e);
+	}
+    
+    // Handle process events
+    currentProcess.on('error', (error) => {
+        console.error(`[${new Date().toISOString()}] Process error:`, error.message);
+        currentProcess = null;
+        // Will be restarted by check interval
+    });
+    
+    currentProcess.on('exit', (code, signal) => {
+        console.log(`[${new Date().toISOString()}] Process exited with code ${code}, signal ${signal}`);
+        currentProcess = null;
+        // Will be restarted by check interval
+    });
+    
+    // Set up 24-hour restart timer
+    if (restartTimer) {
+        clearTimeout(restartTimer);
+    }
+    
+    restartTimer = setTimeout(() => {
+        console.log(`[${new Date().toISOString()}] 24 hours elapsed, restarting process...`);
+        restartProcess();
+    }, RESTART_INTERVAL);
+}
+
+// Restart process (force kill and start new)
+function restartProcess() {
+    // Clear the handle first
+    currentProcess = null;
+    
+    // Force kill all cuBitCrack processes by name
+    forceKillProcess(() => {
+        // Wait a bit then start new process
+        setTimeout(() => {
+            startProcess();
+        }, 2000);
+    });
+}
+
+// Check and ensure process is running
+function checkAndRestart() {
+    try {
+        // First, count how many processes are running
+        countProcesses((count) => {
+            try {
+                if (count > 1) {
+                    // More than 1 process running, kill one
+                    console.log(`[${new Date().toISOString()}] Found ${count} processes running, killing one...`);
+                    getProcessPids((pids) => {
+                        if (pids.length > 0) {
+                            // Kill the first PID (or you could choose a different strategy)
+                            const pidToKill = pids[0];
+                            killProcessByPid(pidToKill, () => {
+                                console.log(`[${new Date().toISOString()}] Killed process with PID ${pidToKill}`);
+                                // If we killed our own process, clear the handle
+                                if (currentProcess && currentProcess.pid === pidToKill) {
+                                    currentProcess = null;
+                                }
+                            });
+                        }
+                    });
+                } else if (count === 0) {
+                    // No process running, start it
+                    if (currentProcess) {
+                        console.log(`[${new Date().toISOString()}] Process not running (handle exists but process dead), restarting...`);
+                        currentProcess = null;
+                    } else {
+                        console.log(`[${new Date().toISOString()}] Process not running, starting...`);
+                    }
+                    startProcess();
+                } else {
+                    // Exactly 1 process running
+                    if (!currentProcess || currentProcess.killed) {
+                        // Process is running but we don't have a valid handle
+                        // This can happen if process was started externally or handle was lost
+                        // We'll just monitor it - if it dies, we'll catch it in next check
+                        if (!currentProcess) {
+                            console.log(`[${new Date().toISOString()}] Process is running (external), monitoring...`);
+                        }
+                    }
+                    // If we have a valid handle and process is running, everything is good
+                }
+            } catch (error) {
+                console.error(`[${new Date().toISOString()}] Error in checkAndRestart callback:`, error);
+                // Continue monitoring - don't let errors stop the checking
+            }
+        });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] Error in checkAndRestart:`, error);
+        // Continue monitoring - don't let errors stop the checking
+    }
+}
+
+// Main function
+function main() {
+    console.log(`[${new Date().toISOString()}] Starting ${EXE_NAME} manager...`);
+    
+    // Set up periodic check - this will run continuously
+    checkInterval = setInterval(() => {
+        checkAndRestart();
+    }, CHECK_INTERVAL);
+    
+    // Initial check and start (immediately, not waiting for first interval)
+    checkAndRestart();
+    
+	// Start monitoring btc_found.txt for real-time updates
+	startBtcFoundMonitor();
+	
+	// Send btc_found.txt contents to Discord every 10 minutes
 	setInterval(() => {
-		sendSharedFoundContent();
-	}, config.foundSendIntervalMs);
-
-	// 6) Report startup status to the Discord status webhook
-	const statusMsg = buildStatusMessage(mode, gpus, manager);
-	logger.info(statusMsg.replace(/\n/g, ' | '));
-	sendStatusDiscordMessage(statusMsg);
+		sendBtcFoundContent();
+	}, BTC_FOUND_SEND_INTERVAL);
+	
+    // Handle uncaught exceptions
+    process.on('uncaughtException', (error) => {
+        console.error(`[${new Date().toISOString()}] Uncaught Exception:`, error);
+        // Don't exit, continue running
+    });
+    
+    // Handle unhandled promise rejections
+    process.on('unhandledRejection', (reason, promise) => {
+        console.error(`[${new Date().toISOString()}] Unhandled Rejection:`, reason);
+        // Don't exit, continue running
+    });
+    
+    // Handle process termination signals
+    process.on('SIGINT', () => {
+        console.log(`[${new Date().toISOString()}] Received SIGINT, cleaning up...`);
+        cleanup();
+        process.exit(0);
+    });
+    
+    process.on('SIGTERM', () => {
+        console.log(`[${new Date().toISOString()}] Received SIGTERM, cleaning up...`);
+        cleanup();
+        process.exit(0);
+    });
 }
 
-// ----------------------------------------------------------------------
-// Cleanup
-// ----------------------------------------------------------------------
-async function cleanup() {
-	logger.info('Shutting down...');
-	if (merger) merger.stop();
-	if (manager) await manager.stop();
-	logger.info('Cleanup completed');
-	process.exit(0);
+// Cleanup function
+function cleanup() {
+    if (restartTimer) {
+        clearTimeout(restartTimer);
+    }
+    if (checkInterval) {
+        clearInterval(checkInterval);
+    }
+    // Clear the handle and kill all clBitCrack.exe processes by name
+    currentProcess = null;
+    forceKillProcess(() => {
+        console.log(`[${new Date().toISOString()}] Cleanup completed`);
+    });
 }
 
-process.on('uncaughtException', (error) => {
-	logger.error('Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (reason) => {
-	logger.error('Unhandled Rejection:', reason);
-});
-
-process.on('SIGINT', () => cleanup());
-process.on('SIGTERM', () => cleanup());
-
+// Start the application
 main();
 
