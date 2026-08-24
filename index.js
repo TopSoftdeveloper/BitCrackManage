@@ -23,7 +23,8 @@ const BTC_FOUND_SEND_INTERVAL = 10 * 60 * 1000; // Send btc_found.txt contents t
 //   puzzle 74: [2^73, 2^74)   7.4 BTC
 //
 // SEARCH_MODE:
-//   'full'  - scan the whole combined range [2^70, 2^74).
+//   'full'  - scan the whole range [2^70, 2^74) when FULL_PUZZLE=0, or only
+//             the selected puzzle's range when FULL_PUZZLE is 71|72|73|74.
 //             Statistically correct for uniformly-random keys (RECOMMENDED).
 //   'focus' - restrict each restart to a narrow "predicted" band (a GAMBLE).
 //             WARNING: analysis of ALL solved keys (run `node analyze.js`)
@@ -37,8 +38,9 @@ const BTC_FOUND_SEND_INTERVAL = 10 * 60 * 1000; // Send btc_found.txt contents t
 //   71|72|73|74 - always search that puzzle's focus band
 //   0           - rotate through the 71,72,73,74 focus bands each restart
 // ============================================================================
-const SEARCH_MODE = 'focus'; // 'full' | 'focus'
-const FOCUS_PUZZLE = 0;      // 71 | 72 | 73 | 74 | 0 (rotate)
+const SEARCH_MODE = 'full';  // 'full' | 'focus'
+const FOCUS_PUZZLE = 0;      // 71 | 72 | 73 | 74 | 0 (rotate) - only used when SEARCH_MODE='focus'
+const FULL_PUZZLE = 71;      // 71 | 72 | 73 | 74 | 0 (all four) - only used when SEARCH_MODE='full'
 
 // Full per-puzzle ranges
 const PUZZLE_RANGES = {
@@ -65,6 +67,14 @@ const FULL_END = 0x3ffffffffffffffffffn;  // 2^74 - 1
 // the bands rotate so all four predictions get coverage over time.
 function selectActiveRange() {
 	if (SEARCH_MODE !== 'focus') {
+		if (FULL_PUZZLE >= 71 && FULL_PUZZLE <= 74) {
+			const r = PUZZLE_RANGES[FULL_PUZZLE];
+			return {
+				start: r.start,
+				end: r.end,
+				label: `full#${FULL_PUZZLE} [0x${r.start.toString(16)}, 0x${r.end.toString(16)}]`
+			};
+		}
 		return { start: FULL_START, end: FULL_END, label: 'full [2^70, 2^74)' };
 	}
 	const candidates = (FOCUS_PUZZLE >= 71 && FOCUS_PUZZLE <= 74) ? [FOCUS_PUZZLE] : [71, 72, 73, 74];
