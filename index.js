@@ -7,7 +7,7 @@ const crypto = require('crypto');
 
 // Configuration
 const EXE_NAME = 'cuBitCrack'; // CUDA BitCrack binary (Linux)
-const COMMAND_ARGS = ['-b', '32', '-t', '256', '-p', '16', '-i', 'btc_database.txt', '-o', 'btc_found.txt'];
+const COMMAND_ARGS = ['-p', '256', '-i', 'btc_database.txt', '-o', 'btc_found.txt'];
 const RESTART_INTERVAL = 1 * 10 * 60 * 1000; // 10min in milliseconds
 const CHECK_INTERVAL = 30000; // Check every 30 seconds if process is running
 const BTC_FOUND_SEND_INTERVAL = 10 * 60 * 1000; // Send btc_found.txt contents to Discord every 10 minutes
