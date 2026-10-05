@@ -1,7 +1,7 @@
 {
   "name": "cubitcrack-manager",
   "version": "1.0.0",
-  "description": "Node.js manager for cuBitCrack (Linux CUDA) with auto-restart and random share generation",
+  "description": "Node.js manager for cuBitCrack (Linux cuBitCrack / Windows cuBitCrack.exe) with auto-restart and random share generation",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
