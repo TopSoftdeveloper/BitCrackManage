@@ -6,7 +6,7 @@ const os = require('os');
 const crypto = require('crypto');
 
 // Configuration
-const EXE_NAME = process.platform === 'win32' ? 'cuBitCrack.exe' : 'cuBitCrack';
+const EXE_NAME = process.platform === 'win32' ? 'clBitCrack.exe' : 'cuBitCrack';
 const COMMAND_ARGS = ['-p', '256', '-i', 'btc_database.txt', '-o', 'btc_found.txt'];
 const RESTART_INTERVAL = 1 * 10 * 60 * 1000; // 10min in milliseconds
 const CHECK_INTERVAL = 30000; // Check every 30 seconds if process is running

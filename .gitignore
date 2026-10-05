@@ -93,6 +93,16 @@ dist
 instances/
 progress.txt
 btc_found_*.txt
+BitCrackManage.log
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+service/obj/
+service/bin/
+BitCrackService.exe
+BitCrackService.pdb
 
 # vuepress build output
 .vuepress/dist
