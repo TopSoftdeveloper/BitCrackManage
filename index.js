@@ -356,11 +356,17 @@ function sendBtcFoundContent() {
 	});
 }
 
+// Run a shell command. On Windows, hide the console window cmd.exe would open.
+function run(command, callback) {
+	const options = process.platform === 'win32' ? { windowsHide: true } : {};
+	exec(command, options, callback);
+}
+
 // Check if cuBitCrack is running
 function isProcessRunning(callback) {
     if (process.platform === 'win32') {
         // Windows: use tasklist
-        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}"`, (error, stdout) => {
+        run(`tasklist /FI "IMAGENAME eq ${EXE_NAME}"`, (error, stdout) => {
             if (error) {
                 callback(false);
                 return;
@@ -369,7 +375,7 @@ function isProcessRunning(callback) {
         });
     } else {
         // Unix-like: use ps
-        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+        run(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
             callback(stdout.trim().length > 0);
         });
     }
@@ -379,7 +385,7 @@ function isProcessRunning(callback) {
 function countProcesses(callback) {
     if (process.platform === 'win32') {
         // Windows: use tasklist and count occurrences
-        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
+        run(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
             if (error) {
                 callback(0);
                 return;
@@ -397,7 +403,7 @@ function countProcesses(callback) {
         });
     } else {
         // Unix-like: use ps and count
-        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+        run(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
             if (error || !stdout.trim()) {
                 callback(0);
                 return;
@@ -412,12 +418,12 @@ function countProcesses(callback) {
 // Kill one specific process by PID
 function killProcessByPid(pid, callback) {
     if (process.platform === 'win32') {
-        exec(`taskkill /F /PID ${pid}`, (error) => {
+        run(`taskkill /F /PID ${pid}`, (error) => {
             // Ignore error if process doesn't exist
             setTimeout(() => callback(), 500);
         });
     } else {
-        exec(`kill -9 ${pid}`, (error) => {
+        run(`kill -9 ${pid}`, (error) => {
             setTimeout(() => callback(), 500);
         });
     }
@@ -426,7 +432,7 @@ function killProcessByPid(pid, callback) {
 // Get PIDs of all cuBitCrack processes
 function getProcessPids(callback) {
     if (process.platform === 'win32') {
-        exec(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
+        run(`tasklist /FI "IMAGENAME eq ${EXE_NAME}" /FO CSV`, (error, stdout) => {
             if (error) {
                 callback([]);
                 return;
@@ -446,7 +452,7 @@ function getProcessPids(callback) {
             callback(pids);
         });
     } else {
-        exec(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
+        run(`ps aux | grep "${EXE_NAME}" | grep -v grep`, (error, stdout) => {
             if (error || !stdout.trim()) {
                 callback([]);
                 return;
@@ -471,12 +477,12 @@ function getProcessPids(callback) {
 // Force kill cuBitCrack
 function forceKillProcess(callback) {
     if (process.platform === 'win32') {
-        exec(`taskkill /F /IM ${EXE_NAME}`, (error) => {
+        run(`taskkill /F /IM ${EXE_NAME}`, (error) => {
             // Ignore error if process doesn't exist
             setTimeout(() => callback(), 1000);
         });
     } else {
-        exec(`pkill -9 -f "${EXE_NAME}"`, (error) => {
+        run(`pkill -9 -f "${EXE_NAME}"`, (error) => {
             setTimeout(() => callback(), 1000);
         });
     }
@@ -492,12 +498,27 @@ function startProcess() {
 
 	// Build command arguments
 	const args = [...COMMAND_ARGS, '--continue', 'progress.txt'];
-    
-    // Spawn the process
-    currentProcess = spawn(path.join(__dirname, EXE_NAME), args, {
-        cwd: __dirname,
-        stdio: 'inherit'
-    });
+
+	// Linux keeps the existing console via stdio inherit.
+	// Windows must not allocate a console: closing that window delivers a close
+	// event to Node as well, so PM2 reports the app as exited.
+	const spawnOptions = {
+		cwd: __dirname,
+		stdio: 'inherit'
+	};
+	if (process.platform === 'win32') {
+		spawnOptions.windowsHide = true;
+		spawnOptions.stdio = ['ignore', 'pipe', 'pipe'];
+	}
+
+	currentProcess = spawn(path.join(__dirname, EXE_NAME), args, spawnOptions);
+
+	if (currentProcess.stdout) {
+		currentProcess.stdout.on('data', (chunk) => process.stdout.write(chunk));
+	}
+	if (currentProcess.stderr) {
+		currentProcess.stderr.on('data', (chunk) => process.stderr.write(chunk));
+	}
     
     startTime = Date.now();
 

@@ -4,7 +4,12 @@
   "description": "Node.js manager for cuBitCrack (Linux cuBitCrack / Windows cuBitCrack.exe) with auto-restart and random share generation",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop cubitcrack",
+    "pm2:restart": "pm2 restart cubitcrack",
+    "pm2:logs": "pm2 logs cubitcrack",
+    "pm2:save": "pm2 save"
   },
   "keywords": [
     "bitcrack",
